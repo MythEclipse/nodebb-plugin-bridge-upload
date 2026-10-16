@@ -53,66 +53,21 @@ jobs:
         run: node test/app-root.test.js
 
       # The Docker-era path must not creep back in. Hardcoding it is what broke
-      # the native install, so any reappearance is a regression.
-      # Strips comments and template literals before matching, so the guard
-      # catches the path in CODE without tripping over the comments in app-root.js
-      # and test/app-root.test.js that explain why it must never come back.
+      # the native install.
+      #
+      # A script file, not an inline `node -e`: the first version of this check
+      # was inline, bash ate the backticks in the double-quoted string, the
+      # template-literal regex arrived mangled, and node exited with
+      # "Unterminated regexp literal" before checking a single file.
       - name: No hardcoded Docker app path
-        run: |
-          set -euo pipefail
-          node -e "
-            const fs = require('fs');
-            const path = require('path');
-            const files = [];
-            (function walk(dir) {
-              for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-                if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
-                const p = path.join(dir, e.name);
-                if (e.isDirectory()) walk(p);
-                else if (e.name.endsWith('.js')) files.push(p);
-              }
-            })('.');
-
-            let bad = 0;
-            for (const f of files) {
-              let code = fs.readFileSync(f, 'utf8');
-              // remove line comments, block comments and template literals
-              code = code
-                .replace(/\/\*[\s\S]*?\*\//g, '')
-                .replace(/^\s*\/\/.*$/gm, '')
-                .replace(/\`(?:[^\`\\]|\\.)*\`/g, '``');
-              if (code.includes('/usr/src/app')) {
-                console.error('FAIL: ' + f + ' references /usr/src/app in code.');
-                bad += 1;
-              }
-            }
-            if (bad) {
-              console.error('      /usr/src/app is the Docker path and does not exist on this host.');
-              console.error('      Resolve the app root instead — see app-root.js.');
-              process.exit(1);
-            }
-            console.log('  checked ' + files.length + ' JS files, no /usr/src/app in code');
-          "
+        run: node scripts/check-no-docker-path.js
 
       # NodeBB reads plugin.json to register the plugin and mounts the route
       # from whatever `load` is exported. An earlier version registered the
       # library as module.exports = function (Plugin) {...}, which NodeBB
       # resolved to nothing at all.
       - name: The route hook must be a direct export
-        run: |
-          set -euo pipefail
-          node -e "
-            const src = require('fs').readFileSync('library.js', 'utf8');
-            if (!/module\.exports\s*=\s*\{[^}]*\bload\b/.test(src)) {
-              console.error('FAIL: \`load\` must be a direct property of module.exports.');
-              process.exit(1);
-            }
-            if (!/module\.exports\.uploadPost\s*=/.test(src)) {
-              console.error('FAIL: uploadPost must be exported so NodeBB\'s controller is reachable.');
-              process.exit(1);
-            }
-          "
-          echo "  load and uploadPost are direct exports"
+        run: node scripts/check-exports.js
 
       - name: Validate plugin.json
         run: |
