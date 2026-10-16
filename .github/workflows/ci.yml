@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: bridge-upload-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: App-root resolution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # NodeBB loads this plugin with a plain require(), so a syntax error is a
+      # restart loop on the live forum rather than a failed deploy.
+      - name: Syntax check every JS file
+        run: |
+          set -euo pipefail
+          count=0
+          for f in $(find . -name '*.js' -not -path './node_modules/*'); do
+            node --check "$f"
+            count=$((count + 1))
+          done
+          echo "checked $count JS files"
+
+      # The regression this exists for: the plugin used to fall back to
+      # '/usr/src/app' when no candidate matched, which made NodeBB log
+      # "Unable to load library" and leave the upload route mounted nowhere —
+      # POST /api/v3/bridge-upload answered 404, identically to a route that
+      # never existed, and nothing failed loudly.
+      #
+      # library.js cannot be require()d from a test: it pulls in
+      # src/routes/helpers, and NodeBB core calls process.exit(0) when those
+      # load outside a booted app. app-root.js is therefore a separate module
+      # precisely so the lookup is testable on its own.
+      - name: Run the app-root tests
+        run: node test/app-root.test.js
+
+      # The Docker-era path must not creep back in. Hardcoding it is what broke
+      # the native install, so any reappearance is a regression.
+      # Strips comments and template literals before matching, so the guard
+      # catches the path in CODE without tripping over the comments in app-root.js
+      # and test/app-root.test.js that explain why it must never come back.
+      - name: No hardcoded Docker app path
+        run: |
+          set -euo pipefail
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const files = [];
+            (function walk(dir) {
+              for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+                const p = path.join(dir, e.name);
+                if (e.isDirectory()) walk(p);
+                else if (e.name.endsWith('.js')) files.push(p);
+              }
+            })('.');
+
+            let bad = 0;
+            for (const f of files) {
+              let code = fs.readFileSync(f, 'utf8');
+              // remove line comments, block comments and template literals
+              code = code
+                .replace(/\/\*[\s\S]*?\*\//g, '')
+                .replace(/^\s*\/\/.*$/gm, '')
+                .replace(/\`(?:[^\`\\]|\\.)*\`/g, '``');
+              if (code.includes('/usr/src/app')) {
+                console.error('FAIL: ' + f + ' references /usr/src/app in code.');
+                bad += 1;
+              }
+            }
+            if (bad) {
+              console.error('      /usr/src/app is the Docker path and does not exist on this host.');
+              console.error('      Resolve the app root instead — see app-root.js.');
+              process.exit(1);
+            }
+            console.log('  checked ' + files.length + ' JS files, no /usr/src/app in code');
+          "
+
+      # NodeBB reads plugin.json to register the plugin and mounts the route
+      # from whatever `load` is exported. An earlier version registered the
+      # library as module.exports = function (Plugin) {...}, which NodeBB
+      # resolved to nothing at all.
+      - name: The route hook must be a direct export
+        run: |
+          set -euo pipefail
+          node -e "
+            const src = require('fs').readFileSync('library.js', 'utf8');
+            if (!/module\.exports\s*=\s*\{[^}]*\bload\b/.test(src)) {
+              console.error('FAIL: \`load\` must be a direct property of module.exports.');
+              process.exit(1);
+            }
+            if (!/module\.exports\.uploadPost\s*=/.test(src)) {
+              console.error('FAIL: uploadPost must be exported so NodeBB\'s controller is reachable.');
+              process.exit(1);
+            }
+          "
+          echo "  load and uploadPost are direct exports"
+
+      - name: Validate plugin.json
+        run: |
+          set -euo pipefail
+          id=$(node -p "require('./plugin.json').id")
+          case "$id" in
+            nodebb-plugin-*) ;;
+            *) echo "FAIL: plugin id must start with nodebb-plugin-, got '$id'"; exit 1 ;;
+          esac
+          echo "  plugin id: $id"
